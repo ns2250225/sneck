@@ -1,4 +1,5 @@
 import { markRaw, reactive } from 'vue'
+import type { NormalizedLandmark } from '@mediapipe/tasks-vision'
 import { CameraManager, classifyCameraError, type CameraDevice, type CameraErrorKind } from './CameraManager'
 import { detectFaces, loadFaceDetector } from './FaceDetector'
 import { estimateHeadPose, type FaceBox, type HeadPose } from './HeadPoseEstimator'
@@ -26,6 +27,52 @@ const PERF_LEVELS = [
   { width: 256, fps: 12 },
 ] as const
 
+/** A second face must persist this long before it is reported; single-frame ghosts stay invisible. */
+const MULTI_FACE_CONFIRM_MS = 400
+/** Two detections overlapping this much are the same physical face (mobile ghost duplicate). */
+const FACE_IOU_DUPLICATE = 0.3
+/** A small detection almost fully covered by a kept face is a partial ghost of it. */
+const FACE_CONTAINMENT_DUPLICATE = 0.8
+
+function landmarksBox(lms: NormalizedLandmark[]): FaceBox {
+  let minX = 1,
+    minY = 1,
+    maxX = 0,
+    maxY = 0
+  for (const l of lms) {
+    if (l.x < minX) minX = l.x
+    if (l.x > maxX) maxX = l.x
+    if (l.y < minY) minY = l.y
+    if (l.y > maxY) maxY = l.y
+  }
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY }
+}
+
+function isDuplicateFace(a: FaceBox, b: FaceBox): boolean {
+  const ix = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x))
+  const iy = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y))
+  const inter = ix * iy
+  if (inter <= 0) return false
+  const union = a.w * a.h + b.w * b.h - inter
+  if (inter / union >= FACE_IOU_DUPLICATE) return true
+  const [small] = a.w * a.h <= b.w * b.h ? [a, b] : [b, a]
+  return inter / (small.w * small.h) >= FACE_CONTAINMENT_DUPLICATE
+}
+
+/**
+ * Drops ghost detections of the same physical face, which mobile front cameras
+ * (low resolution, noise, motion blur) frequently produce alongside the real one.
+ */
+function dedupeFaces(groups: NormalizedLandmark[][]): NormalizedLandmark[][] {
+  const kept: { lms: NormalizedLandmark[]; box: FaceBox }[] = []
+  for (const lms of groups) {
+    if (!lms || lms.length < 468) continue
+    const box = landmarksBox(lms)
+    if (!kept.some(k => isDuplicateFace(k.box, box))) kept.push({ lms, box })
+  }
+  return kept.map(k => k.lms)
+}
+
 class HeadTrackerImpl {
   private camera: CameraManager | null = null
   private filter = new PoseFilter()
@@ -38,6 +85,8 @@ class HeadTrackerImpl {
   private fpsFrames = 0
   private fpsWindowStart = 0
   private lastPerfChange = 0
+  /** Timestamp when the current multi-face episode began; 0 = currently single face. */
+  private multiFaceSince = 0
   private listeners = new Set<(f: TrackerFrame) => void>()
   private suspended = false
 
@@ -134,6 +183,7 @@ class HeadTrackerImpl {
     this.state.phase = 'running'
     this.filter.reset()
     this.detectCost.clear()
+    this.multiFaceSince = 0
     this.lastVideoTime = -1
     this.fpsWindowStart = performance.now()
     this.fpsFrames = 0
@@ -170,6 +220,7 @@ class HeadTrackerImpl {
     this.state.cameraReady = false
     this.state.phase = 'idle'
     this.state.detectFps = 0
+    this.multiFaceSince = 0
     this.state.frame = { time: 0, faces: 0, confidence: 0, box: null, abs: null, rel: null }
   }
 
@@ -218,10 +269,20 @@ class HeadTrackerImpl {
     const cost = performance.now() - t0
     this.adaptPerformance(cost, now)
 
-    const faces = result?.faceLandmarks?.length ?? 0
+    const raw = result?.faceLandmarks ?? []
+    const kept = dedupeFaces(raw)
+    let faces = kept.length
+    if (faces > 1) {
+      // Debounce: only trust a second face once it has stuck around for a while.
+      if (this.multiFaceSince === 0) this.multiFaceSince = now
+      if (now - this.multiFaceSince < MULTI_FACE_CONFIRM_MS) faces = 1
+    } else {
+      this.multiFaceSince = 0
+    }
+
     let frame: TrackerFrame = { time: now, faces, confidence: 0, box: null, abs: null, rel: null }
-    if (faces >= 1 && result) {
-      const est = estimateHeadPose(result.faceLandmarks[0], vw, vh)
+    if (faces >= 1 && kept.length >= 1 && result) {
+      const est = estimateHeadPose(kept[0], vw, vh)
       if (est) {
         const abs = this.filter.filter(est.pose, now)
         frame = { ...frame, confidence: est.confidence, box: est.box, abs, rel: this.relative(abs) }
